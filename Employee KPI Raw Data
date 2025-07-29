@@ -1,0 +1,123 @@
+// Search across application and equipment indexes for site ZLXH and a specific host
+index=uds_application OR index=uds_equipment sourcetype=* site=ZLXH host=GBZLXA-FLC
+
+// Extract or fallback to the barcode value for the loading unit
+| eval loading_unit = coalesce(
+      json_extract(Message,"LoadingUnit.Barcode"),      // Preferred structured path
+      json_extract(Message,"Barcode")                   // Fallback if above is null
+  )
+
+// Extract handling unit (HU) barcode
+| eval handling_unit = json_extract(Message,"HandlingUnit.Barcode")
+
+// Extract scan timestamp, scan user, device ID, and LU destination from message
+| eval init_ScanDateTime = json_extract(Message,"ScanDateTime")
+| eval init_ScanUserID   = json_extract(Message,"ScanUserId")
+| eval init_DeviceID     = json_extract(Message,"DeviceId")
+| eval init_Destination  = json_extract(Message,"LoadingUnit.Destination")
+
+// Rename the raw source field to differentiate from joined logs
+| rename source as init_source
+
+// Keep only events where a scan user ID is present (filter out system/no-user logs)
+| where isnotnull(init_ScanUserID)
+
+/////////////////////////////////////////////////////////////////////////////////////
+// JOIN: Enrich main events with LuAssetId values from relevant validation events
+/////////////////////////////////////////////////////////////////////////////////////
+| join type=left loading_unit handling_unit [
+    // Search again for relevant trailer validation logs
+    search index=uds_application OR index=uds_equipment sourcetype=uds.core.log site=ZLXH host=GBZLXA-FLC
+    Event IN ("RfLoadingValidationWithData", "RfLoadingValidationRequestForPackage")
+
+    // Extract LU/HU barcodes and trailer asset ID from raw message string
+    | rex "HuBarcode=(?<handling_unit>[^;]+)"
+    | rex "LuBarcode=(?<loading_unit>[^;]+)"
+    | rex "LuAssetId=(?<LuAssetId>[^;]+)"
+
+    // Aggregate all matched LuAssetIds for each LU/HU combo
+    | stats values(LuAssetId) as LuAssetIds by loading_unit handling_unit
+]
+
+/////////////////////////////////////////////////////////////////////////////////////
+// TRAILER ASSET INFERENCE: Resolve missing trailer IDs and classify trailer type
+/////////////////////////////////////////////////////////////////////////////////////
+
+// If no LuAssetId found, label as "(none)", otherwise join multiple values
+| eval LuAssetId = if(isnull(LuAssetIds), "(none)", mvjoin(LuAssetIds, ", "))
+
+// Collect all asset IDs observed for the same loading unit
+| eventstats values(LuAssetId) as allAssetIds by loading_unit
+
+// Filter out known invalid/empty trailer values
+| eval fallbackAssets = mvfilter(allAssetIds!="(none)")
+
+// Use fallback asset ID if the current LuAssetId is still missing
+| eval LuAssetId = if(
+      LuAssetId=="(none)" AND mvcount(fallbackAssets)>0,
+      mvindex(fallbackAssets,0),
+      LuAssetId
+  )
+
+// Determine trailer type from LuAssetId naming pattern
+| eval trailer_type = case(
+    like(LuAssetId, "BULK%"), "BULK",
+    like(LuAssetId, "T%"), "Trailer",
+    like(LuAssetId, "ZLXH%"), "Bay Door",
+    isnotnull(LuAssetId), "Other Trailer",
+    true(), null()
+)
+
+/////////////////////////////////////////////////////////////////////////////////////
+// BARCODE DERIVATION: Parse CONs and tracking numbers from LU and HU barcodes
+/////////////////////////////////////////////////////////////////////////////////////
+
+// Derive CONs number from LU barcode based on format rules
+| eval CONs_Number = case(
+    isnotnull(loading_unit) AND substr(loading_unit, 1, 1) == "6", substr(loading_unit, -14, 11),
+    isnotnull(loading_unit) AND len(loading_unit) == 34 AND substr(loading_unit, 1, 1) == "1", substr(loading_unit, -12, 12),
+    isnotnull(loading_unit), substr(loading_unit, -12, 12)
+)
+
+// Compute the length of HU barcode for use in logic below
+| eval hu_length = len(handling_unit)
+
+// Extract tracking number from HU using multiple known pattern formats
+| eval Tracking_number = case(
+    match(handling_unit, "[A-Za-z]"), substr(replace(handling_unit, "^[A-Za-z]", ""), 1, 12),        // Strip leading letters
+    hu_length == 33, substr(handling_unit, 22, 11),                                                  // Special 33-char format
+    hu_length >= 12 AND substr(handling_unit, 1, 1) == "6", substr(handling_unit, hu_length - 13, 11),
+    match(handling_unit, "0{6,7}$"), substr(handling_unit, 5, 11),                                   // Ends in zeros
+    hu_length == 34 AND substr(handling_unit, 1, 1) == "1", substr(handling_unit, hu_length - 11, 12),
+    hu_length >= 11, substr(handling_unit, hu_length - 11, 12),                                      // Fallback generic
+    true(), "Invalid Barcode"
+)
+
+/////////////////////////////////////////////////////////////////////////////////////
+// FINAL CLEAN-UP AND OUTPUT FORMATTING
+/////////////////////////////////////////////////////////////////////////////////////
+
+// Replace null LuAssetId with explicit "(none)" label
+| eval LuAssetId = if(isnull(LuAssetId), "(none)", LuAssetId)
+
+// Only retain rows where both LU and HU barcodes are present
+| where isnotnull(loading_unit)
+| where isnotnull(handling_unit)
+
+// Add single quotes around barcodes for readability/presentation
+| eval handling_unit="'" . tostring(handling_unit)
+| eval loading_unit="'" . tostring(loading_unit)
+
+// Output the final table with key data columns
+| table
+    init_source,
+    loading_unit,
+    handling_unit,
+    init_ScanDateTime,
+    CONs_Number,
+    Tracking_number,
+    init_ScanUserID,
+    init_DeviceID,
+    init_Destination,
+    LuAssetId,
+    trailer_type
